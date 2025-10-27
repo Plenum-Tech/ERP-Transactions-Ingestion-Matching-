@@ -1,165 +1,56 @@
 # app/routers/tx_ingest.py
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, List, Tuple
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request
+import os, re, json, hashlib
+from typing import Optional, Dict, Any, List, Tuple, Set
 from datetime import datetime, date
-import hashlib, re, os
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request
 
 from app.db import db_conn
 from app.di_extractors import bank_statement as di_bank
 from app.di_extractors import receipt as di_receipt
 from app.utils.logger import get_logger, log_duration
 
+# ==== Router & config =========================================================
 router = APIRouter(prefix="/tx", tags=["transactions-ingest"])
 log = get_logger(__name__)
 
 DEFAULT_CCY = os.getenv("DEFAULT_CURRENCY", "AED")
 RECO_STATEMENT_TYPE = os.getenv("RECO_STATEMENT_TYPE", "Bank Reconciliation")
+AI_TX_BATCH_SIZE = int(os.getenv("AI_TX_BATCH_SIZE", "40"))
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# ------------------------------------------------------------------------------
-# Normalization helpers
-# ------------------------------------------------------------------------------
-_DATE_PATTERNS: List[Tuple[str, str]] = [
-    # ISO & Y/M/D
-    (r"^\d{4}-\d{2}-\d{2}$", "%Y-%m-%d"),
-    (r"^\d{4}/\d{2}/\d{2}$", "%Y/%m/%d"),
+# ==== OpenAI client (official SDK v1) ========================================
+try:
+    from openai import OpenAI
+    _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY",""))
+except Exception as e:
+    _openai_client = None
+    _openai_client_error = e
 
-    # D/M/Y numeric
-    (r"^\d{2}/\d{2}/\d{4}$", "%d/%m/%Y"),
-    (r"^\d{2}-\d{2}-\d{4}$", "%d-%m-%Y"),
-    (r"^\d{2}/\d{2}/\d{2}$",  "%d/%m/%y"),
-    (r"^\d{2}-\d{2}-\d{2}$",  "%d-%m-%y"),
-
-    # M/D/Y numeric (US-style)
-    (r"^\d{1,2}/\d{1,2}/\d{4}$", "%m/%d/%Y"),
-    (r"^\d{1,2}-\d{1,2}-\d{4}$", "%m-%d-%Y"),
-    (r"^\d{1,2}/\d{1,2}/\d{2}$",  "%m/%d/%y"),
-    (r"^\d{1,2}-\d{1,2}-\d{2}$",  "%m-%d-%y"),
-
-    # Day-first with month names
-    (r"^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$",  "%d %b %Y"),
-    (r"^\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}$", "%d %B %Y"),
-    (r"^\d{1,2}\s+[A-Za-z]{3}\s+\d{2}$",  "%d %b %y"),
-    (r"^\d{1,2}\s+[A-Za-z]{3,}\s+\d{2}$", "%d %B %y"),
-    (r"^\d{1,2}/[A-Za-z]{3}/\d{4}$",      "%d/%b/%Y"),
-    (r"^\d{1,2}-[A-Za-z]{3}-\d{4}$",      "%d-%b-%Y"),
-    (r"^\d{1,2}/[A-Za-z]{3}/\d{2}$",      "%d/%b/%y"),
-    (r"^\d{1,2}-[A-Za-z]{3}-\d{2}$",      "%d-%b-%y"),
-
-    # Month-first with names (with/without comma)
-    (r"^[A-Za-z]{3,}\s+\d{1,2},\s*\d{4}$", "%B %d, %Y"),
-    (r"^[A-Za-z]{3}\s+\d{1,2},\s*\d{4}$",  "%b %d, %Y"),
-    (r"^[A-Za-z]{3,}\s+\d{1,2}\s+\d{4}$",  "%B %d %Y"),
-    (r"^[A-Za-z]{3}\s+\d{1,2}\s+\d{4}$",   "%b %d %Y"),
-]
-
-# date tokens we’ll also try to discover inside descriptions
-_DESC_DATE_TOKENS = [
-    r"\b\d{4}-\d{2}-\d{2}\b",
-    r"\b\d{2}/\d{2}/\d{4}\b",
-    r"\b\d{2}-\d{2}-\d{4}\b",
-    r"\b\d{4}/\d{2}/\d{2}\b",
-    r"\b\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}\b",
-    r"\b\d{1,2}\s+[A-Za-z]{3,}\s+\d{2}\b",
-    r"\b\d{1,2}/[A-Za-z]{3}/\d{4}\b",
-    r"\b\d{1,2}-[A-Za-z]{3}-\d{4}\b",
-    r"\b\d{1,2}/[A-Za-z]{3}/\d{2}\b",
-    r"\b\d{1,2}-[A-Za-z]{3}-\d{2}\b",
-    # numeric day/month without year like 31/07 or 07-31 or 31.7
-    r"\b\d{1,2}[./-]\d{1,2}\b",
-]
-
-_RX_DAY_MON_NOYEAR = re.compile(r"^(\d{1,2})\s+([A-Za-z]{3,})$")
-_RX_NUM_NOYEAR = re.compile(r"^(\d{1,2})[./-](\d{1,2})$")
-
-def _try_parse_with_month_case(s: str, fmt: str) -> Optional[date]:
-    if "%b" in fmt or "%B" in fmt:
-        parts = s.split()
-        s = " ".join(p.capitalize() if p.isalpha() else p for p in parts)
-    try:
-        return datetime.strptime(s, fmt).date()
-    except Exception:
-        return None
-
-def _try_parse_numeric_no_year(s: str, default_year: Optional[int]) -> Optional[date]:
-    """
-    Accept "31/07", "07-31", "31.7" etc and inject default_year.
-    Prefer **day-first** (DD/MM) for GCC banks when ambiguous.
-    """
-    if not default_year:
-        return None
-    m = _RX_NUM_NOYEAR.match(s.strip())
-    if not m:
-        return None
-    a = int(m.group(1))
-    b = int(m.group(2))
-    # decide ordering
-    if a > 12 and 1 <= b <= 12:
-        day, mon = a, b
-    elif b > 12 and 1 <= a <= 12:
-        day, mon = b, a
-    else:
-        day, mon = a, b  # ambiguous -> DD/MM
-    # build and test
-    for fmt in ("%d/%m/%Y", "%m/%d/%Y"):
-        try:
-            return datetime.strptime(f"{day:02d}/{mon:02d}/{default_year}", fmt).date()
+# ==== Minimal helpers =========================================================
+def _as_date(v: Any) -> Optional[date]:
+    if v is None: return None
+    if isinstance(v, date) and not isinstance(v, datetime): return v
+    if isinstance(v, datetime): return v.date()
+    if isinstance(v, str):
+        s = v.strip()
+        for fmt in ("%Y-%m-%d","%d-%b-%Y","%d-%B-%Y","%d/%m/%Y","%Y/%m/%d","%m/%d/%Y"):
+            try: return datetime.strptime(s, fmt).date()
+            except Exception: pass
+        try: return datetime.fromisoformat(s.replace("Z","+00:00")).date()
         except Exception:
-            continue
+            try: return date.fromisoformat(s[:10])
+            except Exception: return None
     return None
 
-def _to_date_strict(v: Any) -> Optional[date]:
-    if v is None:
-        return None
-    if isinstance(v, date) and not isinstance(v, datetime):
-        return v
-    if isinstance(v, datetime):
-        return v.date()
-    s = str(v).strip()
-    for rx, fmt in _DATE_PATTERNS:
-        if re.match(rx, s):
-            d = _try_parse_with_month_case(s, fmt)
-            if d:
-                return d
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
-    except Exception:
-        return None
-
-def _to_date_flex(v: Any, default_year: Optional[int] = None) -> Optional[date]:
-    # Try strict formats first
-    d = _to_date_strict(v)
-    if d is not None:
-        return d
-    s = (str(v) if v is not None else "").strip()
-    if not s:
-        return None
-    # numeric day/month without year
-    d2 = _try_parse_numeric_no_year(s, default_year)
-    if d2:
-        return d2
-    # "DD Mon" with no year → inject year
-    m = _RX_DAY_MON_NOYEAR.match(s)
-    if m and default_year:
-        day, mon = m.group(1), m.group(2)
-        for fmt in ("%d %b %Y", "%d %B %Y"):
-            d3 = _try_parse_with_month_case(f"{day} {mon} {default_year}", fmt)
-            if d3:
-                return d3
-    return None
-
-def _to_num(v: Any):
-    if v is None:
-        return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    s = str(v).strip()
+def _num_soft(v: Any) -> Optional[float]:
+    if v is None: return None
+    if isinstance(v, (int, float)): return float(v)
+    s = str(v)
     neg = "(" in s and ")" in s
-    s = s.replace(",", "")
-    s2 = re.sub(r"[^\d.\-]", "", s)
-    if s2 in ("", ".", "-", "-."):
-        return None
+    s2 = re.sub(r"[^0-9.\-]", "", s)
+    if s2 in ("",".","-","-."): return None
     try:
         n = float(s2)
         return -abs(n) if neg and n > 0 else n
@@ -167,10 +58,9 @@ def _to_num(v: Any):
         return None
 
 def _norm_merchant(s: Optional[str]) -> Optional[str]:
-    if not s:
-        return None
+    if not s: return None
     x = s.upper().strip()
-    x = re.sub(r"[^A-Z0-9 &\.\-]", " ", x)
+    x = re.sub(r"[^A-Z0-9 &.\-]", " ", x)
     x = re.sub(r"\b(LLC|LTD|CO|INC|PJSC|PVT)\b", "", x)
     x = re.sub(r"\s+", " ", x).strip()
     return x or None
@@ -179,347 +69,246 @@ def _fp(parts: List[str]) -> str:
     base = "|".join("" if p is None else str(p) for p in parts)
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
+def _infer_currency_from_result(di_result: Any) -> Optional[str]:
+    hints = {"£":"GBP","GBP":"GBP","€":"EUR","EUR":"EUR","$":"USD","USD":"USD",
+             "AED":"AED","SAR":"SAR","QAR":"QAR","OMR":"OMR","BHD":"BHD"}
+    try:
+        for p in getattr(di_result, "pages", []) or []:
+            for ln in getattr(p, "lines", []) or []:
+                txt = (getattr(ln, "content", "") or "").upper()
+                for token, code in hints.items():
+                    if token in txt: return code
+        for tbl in getattr(di_result, "tables", []) or []:
+            for c in getattr(tbl, "cells", []) or []:
+                txt = (getattr(c, "content", "") or "").upper()
+                for token, code in hints.items():
+                    if token in txt: return code
+    except Exception:
+        pass
+    return None
+
 def _getv(d: Dict[str, Any], *keys: str) -> Any:
-    """Return d[k]['value'] if present, else d[k] if primitive/non-null."""
     for k in keys:
         if k in d:
             obj = d[k]
-            if isinstance(obj, dict) and "value" in obj:
-                return obj["value"]
-            if obj is not None:
-                return obj
+            if isinstance(obj, dict) and "value" in obj: return obj["value"]
+            if obj is not None: return obj
     return None
 
-def _date_from_tx(tx: Dict[str, Any], desc: Optional[str], stmt_year: Optional[int]) -> Optional[date]:
-    # Include common date fields; fall back to description scanning
-    raw = _getv(tx, "Date", "TransactionDate", "PostingDate", "PostDate", "ValueDate", "BookingDate")
-    dt = _to_date_flex(raw, default_year=stmt_year)
-    if dt is not None:
-        return dt
-    if desc:
-        for rx in _DESC_DATE_TOKENS:
-            m = re.search(rx, desc)
-            if m:
-                dt2 = _to_date_flex(m.group(0), default_year=stmt_year)
-                if dt2:
-                    return dt2
+def _gather_text(di_result: Any) -> str:
+    try:
+        return "\n".join((ln.content or "") for p in (getattr(di_result, "pages", []) or []) for ln in (p.lines or []))
+    except Exception:
+        return ""
+
+# ==== Bank/statement fallbacks ===============================================
+_BANK_PATTERNS = [
+    (re.compile(r"\bFIRST\s+ABU\s+DHABI\s+BANK\b", re.I), "First Abu Dhabi Bank"),
+    (re.compile(r"\bEMIRATES\s+NBD\b", re.I),            "Emirates NBD"),
+    (re.compile(r"\bABU\s+DHABI\s+COMMERCIAL\s+BANK\b|\bADCB\b", re.I), "Abu Dhabi Commercial Bank"),
+    (re.compile(r"\bMASHREQ\b", re.I),                   "Mashreq Bank"),
+    (re.compile(r"\bDUBAI\s+ISLAMIC\s+BANK\b|\bDIB\b", re.I), "Dubai Islamic Bank"),
+    (re.compile(r"\bRAK\s*BANK\b|\bRAKBANK\b", re.I),    "RAKBANK"),
+    (re.compile(r"\bSTANDARD\s+CHARTERED\b", re.I),      "Standard Chartered"),
+    (re.compile(r"\bHSBC\b", re.I),                      "HSBC"),
+]
+
+def _infer_bank_name(fields: Dict[str, Any], di_result: Any, filename_hint: Optional[str]) -> Optional[str]:
+    bank_name = (fields.get("BankName") or {}).get("value")
+    if bank_name: return bank_name
+    text = _gather_text(di_result)
+    for rx, name in _BANK_PATTERNS:
+        if rx.search(text): return name
+    if filename_hint:
+        up = filename_hint.upper()
+        for rx, name in _BANK_PATTERNS:
+            if rx.search(up): return name
+        if " BANKFAB " in f" {up} " or " FAB " in f" {up} ":
+            return "First Abu Dhabi Bank"
     return None
 
-def _amount_from_tx_raw_sign(num: Optional[float], raw: Any) -> Optional[float]:
-    if num is None:
-        return None
-    if isinstance(raw, (int, float)):
-        return float(raw)
-    s = str(raw or "")
-    if s.strip().startswith("-") or ("(" in s and ")" in s):
-        return -abs(num)
-    return num
+def _infer_statement_date(fields: Dict[str, Any], di_result: Any, accounts: List[Dict[str, Any]]) -> Optional[date]:
+    d = _as_date((fields.get("StatementEndDate") or {}).get("value"))
+    if d: return d
+    text = _gather_text(di_result)
+    m = re.search(r"Statement\s+generated\s+on:\s*([0-9]{1,2}-[A-Za-z]{3}-[0-9]{4})", text, re.I)
+    if m:
+        d = _as_date(m.group(1))
+        if d: return d
+    m2 = re.search(r"Account\s+statement:\s*.*?\bto\b\s*([0-9]{1,2}-[A-Za-z]{3}-[0-9]{4})", text, re.I | re.S)
+    if m2:
+        d = _as_date(m2.group(1))
+        if d: return d
+    max_tx: Optional[date] = None
+    for acc in accounts or []:
+        for t in (acc.get("Transactions") or []):
+            cand = _as_date(_getv(t, "TransactionDate","PostingDate","PostDate","Date","BookingDate","ValueDate"))
+            if cand and (max_tx is None or cand > max_tx):
+                max_tx = cand
+    return max_tx
 
+# ==== Amount + continuation utilities ========================================
 def _signed_amount_from_tx(tx: Dict[str, Any]) -> Optional[float]:
     raw_amount = _getv(tx, "Amount", "TransactionAmount")
-    amt = _to_num(raw_amount)
+    amt = _num_soft(raw_amount)
     if amt is not None:
-        tval = str(_getv(tx, "Type", "CreditDebit", "TransactionType") or "").strip().lower()
-        if tval in ("debit", "dr", "withdrawal", "payment", "out"):
+        tval = str(_getv(tx, "Type","CreditDebit","TransactionType") or "").strip().lower()
+        if tval in ("debit","dr","withdrawal","payment","out","card debit","debit card transaction"):
             return -abs(amt)
-        if tval in ("credit", "cr", "deposit", "in"):
+        if tval in ("credit","cr","deposit","in","salary transfer","salary","paid in"):
             return abs(amt)
-        return _amount_from_tx_raw_sign(abs(amt), raw_amount)
+        s = str(raw_amount or "")
+        if s.strip().startswith("-") or ("(" in s and ")" in s):
+            return -abs(amt)
+        return amt
 
-    dep = _to_num(_getv(tx, "DepositAmount", "Credit", "PaidIn", "In"))
-    wdr = _to_num(_getv(tx, "WithdrawalAmount", "Debit", "PaidOut", "Out"))
+    dep = _num_soft(_getv(tx, "DepositAmount","Credit","PaidIn","In"))
+    wdr = _num_soft(_getv(tx, "WithdrawalAmount","Debit","PaidOut","Out"))
     if dep is not None or wdr is not None:
         dep = dep or 0.0
         wdr = wdr or 0.0
         return dep - abs(wdr)
 
-    credit = _to_num(_getv(tx, "Credit"))
-    debit  = _to_num(_getv(tx, "Debit"))
-    if credit is not None:
-        return abs(credit)
-    if debit is not None:
-        return -abs(debit)
+    credit = _num_soft(_getv(tx, "Credit"))
+    debit  = _num_soft(_getv(tx, "Debit"))
+    if credit is not None: return abs(credit)
+    if debit  is not None: return -abs(debit)
     return None
 
-# ------------------------------------------------------------------------------
-# Currency helpers
-# ------------------------------------------------------------------------------
-_CURRENCY_HINTS = {
-    "£": "GBP", "GBP": "GBP", "€": "EUR", "EUR": "EUR", "$": "USD", "USD": "USD",
-    "AED": "AED", "SAR": "SAR", "QAR": "QAR", "OMR": "OMR", "BHD": "BHD"
+def _desc_of(tx: Dict[str, Any]) -> Optional[str]:
+    return _getv(tx, "Description")
+
+def _candidate_dates(tx: Dict[str, Any]) -> Set[date]:
+    ks = ("TransactionDate","PostingDate","PostDate","Date","BookingDate","ValueDate","ValDate","Value Date")
+    out: Set[date] = set()
+    for k in ks:
+        d = _as_date(_getv(tx, k))
+        if d: out.add(d)
+    return out
+
+def _is_continuation(prev_anchor: Dict[str, Any], curr: Dict[str, Any]) -> bool:
+    """
+    Treat `curr` as a continuation of `prev_anchor` when:
+      - curr has NO amount, AND
+      - (curr has NO date) OR (curr's date(s) equal prev's date(s))
+    This captures visual wrap rows where DI repeats dates but omits amount.
+    """
+    if not prev_anchor or not curr: return False
+    if not ((_desc_of(curr) or "").strip()): return False
+    if _signed_amount_from_tx(curr) is not None:  # continuation rows never carry amount
+        return False
+    curr_dates = _candidate_dates(curr)
+    if not curr_dates:
+        return True
+    prev_dates = _candidate_dates(prev_anchor)
+    return bool(prev_dates and curr_dates and curr_dates.issubset(prev_dates))
+
+def _stitch_wrapped_lines(txs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    stitched: List[Dict[str, Any]] = []
+    appended = 0
+    for tx in txs or []:
+        if stitched and _is_continuation(stitched[-1], tx):
+            d_next = (_desc_of(tx) or "").strip()
+            if d_next:
+                prev = stitched[-1]
+                prev_desc = (_getv(prev, "Description") or "")
+                prev.setdefault("Description", (prev_desc + " " + d_next).strip())
+                appended += 1
+            continue
+        stitched.append(tx)
+    return stitched, appended
+
+# ---- description composer ----------------------------------------------------
+_GENERIC_KINDS = {
+    "debit card transaction", "atm cash withdrawal", "salary transfer",
+    "ipp transfer", "ipp charges", "cash chq withdrawal",
+    "guarantee issue commission", "vat charges", "monthly charge",
 }
+def _compose_description(kind: Optional[str], tx_text: Optional[str]) -> Optional[str]:
+    if not kind and not tx_text: return None
+    if kind and tx_text:
+        if kind.strip().lower() in _GENERIC_KINDS and tx_text.strip():
+            if tx_text.lower() not in kind.lower():
+                return f"{kind.strip()} - {tx_text.strip()}"
+    return kind or tx_text
 
-def _infer_currency_from_result(di_result: Any) -> Optional[str]:
-    """Scan DI result lines/tables for currency symbols/codes."""
-    try:
-        for p in getattr(di_result, "pages", []) or []:
-            for ln in getattr(p, "lines", []) or []:
-                txt = (getattr(ln, "content", "") or "").upper()
-                for token, code in _CURRENCY_HINTS.items():
-                    if token in txt:
-                        return code
-        for tbl in getattr(di_result, "tables", []) or []:
-            for c in getattr(tbl, "cells", []) or []:
-                txt = (getattr(c, "content", "") or "").upper()
-                for token, code in _CURRENCY_HINTS.items():
-                    if token in txt:
-                        return code
-    except Exception:
-        pass
-    return None
+# ==== LLM mapping =============================================================
+_LLM_SYSTEM = """You are a finance extraction engine that maps raw bank statement transaction objects
+(from OCR/Document-Intelligence) into a strict ERP row schema. Return STRICT JSON only.
+Never hallucinate; use null when a field is not present. Rules:
 
-_CHANNEL_PREFIX = re.compile(r"^(BACS|FASTER PAYMENT|CHQ|CHEQUE|CARD|POS|ATM|BANK)\b[\s:-]*", re.I)
+- Dates: 'YYYY-MM-DD' or null.
+- Amount sign: credits (paid in / deposit / credit / salary) are POSITIVE; debits are NEGATIVE.
+- 'description': transaction kind (e.g., 'Debit Card Transaction', 'ATM Cash Withdrawal', 'Salary Transfer'), concise.
+- 'transaction_text': merchant/counterparty text (e.g., 'CARREFOUR RAK', 'FAB', 'KEYSTONE GROUP LLC FZ').
+- 'check_no': if cheque is mentioned, extract cheque number (4+ alphanum) else null.
+- 'related_party_name': counterparty or merchant when clearly present.
+- 'additional_transaction_info' and 'reference': approval/ref/rrn/auth-like tokens when present.
+- Preserve input order; one output row per input row. Do not omit rows.
+"""
 
-def _clean_channel_prefix(s: Optional[str]) -> Optional[str]:
-    if not s:
-        return None
-    t = _CHANNEL_PREFIX.sub("", s or "").strip()
-    return t or s
+_LLM_USER_TEMPLATE = """Context:
+- Statement End Date (if known): {statement_end_date}
+- Bank Name (if known): {bank_name}
+- Default Currency: {default_currency}
 
-_REF_RX = re.compile(r"(AUTH|APPROVAL|RRN|REF|CHQ|CHEQUE)[\s:#-]*([A-Z0-9]{4,})", re.I)
+Map the following transaction objects to ERP rows. Input array length = {n}.
+Return EXACT JSON with top-level key "rows" (array length {n}). Each element MUST have exactly these keys:
 
-# ------------------------------------------------------------------------------
-# Year inference helpers
-# ------------------------------------------------------------------------------
-def _collect_years_from_any(obj: Any) -> List[int]:
-    years: List[int] = []
-    def _walk(x: Any):
-        if isinstance(x, dict):
-            for v in x.values():
-                _walk(v)
-        elif isinstance(x, list):
-            for v in x:
-                _walk(v)
-        elif isinstance(x, str):
-            for m in re.finditer(r"(19|20)\d{2}", x):
-                y = int(m.group(0))
-                if 1900 <= y <= 2100:
-                    years.append(y)
-    _walk(obj)
-    return years
+[
+  "transaction_date",
+  "value_date",
+  "description",
+  "transaction_text",
+  "statement_amount",
+  "check_no",
+  "related_party_name",
+  "additional_transaction_info",
+  "reference"
+]
 
-def _collect_months_from_accounts(accounts: List[Dict[str, Any]]) -> List[int]:
-    months: List[int] = []
-    mon_map = {
-        "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
-        "jul":7,"aug":8,"sep":9,"sept":9,"oct":10,"nov":11,"dec":12
-    }
-    for acc in accounts or []:
-        for t in (acc.get("Transactions") or []):
-            v = _getv(t, "Date", "TransactionDate", "PostingDate", "PostDate", "ValueDate", "BookingDate")
-            s = (str(v) if v is not None else "").strip().lower()
-            m1 = re.match(r"^\d{1,2}\s+([a-z]{3,})$", s)
-            m2 = re.match(r"^([a-z]{3,})\s+\d{1,2}$", s)
-            token = (m1.group(1) if m1 else (m2.group(1) if m2 else None))
-            if token:
-                key = token.replace("sept","sep")[:3]
-                mm = mon_map.get(key, 0)
-                if 1 <= mm <= 12:
-                    months.append(mm)
-    return months
+Input transactions JSON:
+{tx_json}
+"""
 
-def _infer_year_from_months(tx_months: List[int], now: Optional[date] = None) -> Optional[int]:
-    if not tx_months:
-        return None
-    now = now or date.today()
-    return now.year
-
-def _resolve_stmt_year(shaped: Dict[str, Any], accounts: List[Dict[str, Any]]) -> Tuple[Optional[int], str]:
-    """
-    Try multiple strategies to get a year:
-    1) Concrete year from shaped->fields StatementEndDate/StartDate
-    2) Any 4-digit year anywhere in the shaped dict
-    3) Infer from months present in the transaction rows
-    """
-    fields = shaped.get("fields") or {}
-    stmt_end = (fields.get("StatementEndDate") or {}).get("value")
-    stmt_start = (fields.get("StatementStartDate") or {}).get("value")
-
-    for label, candidate in (("end_date", stmt_end), ("start_date", stmt_start)):
-        d = _to_date_strict(candidate)
-        if d:
-            return d.year, f"from_{label}"
-
-    years = _collect_years_from_any(shaped)
-    if years:
-        return max(years), "from_text_scan"
-
-    months = _collect_months_from_accounts(accounts)
-    y = _infer_year_from_months(months, date.today())
-    if y:
-        return y, "from_months_inference"
-
-    return None, "unknown"
-
-# ------------------------------------------------------------------------------
-# Deep scan + canonical date extraction
-# ------------------------------------------------------------------------------
-def _deep_scan_key_like(obj: Any, include_tokens: Tuple[str, ...], exclude_tokens: Tuple[str, ...] = ()) -> Optional[Any]:
-    """
-    Recursively search dict/list for a key whose normalized name contains all include_tokens
-    and none of exclude_tokens; return its primitive value (prefer .get('value') or .get('content')).
-    """
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            kk = k.replace(" ", "").replace("_", "").lower()
-            if all(t in kk for t in include_tokens) and not any(t in kk for t in exclude_tokens):
-                if isinstance(v, dict):
-                    if "value" in v: return v.get("value")
-                    if "content" in v: return v.get("content")
-                return v
-            r = _deep_scan_key_like(v, include_tokens, exclude_tokens)
-            if r is not None:
-                return r
-    elif isinstance(obj, list):
-        for it in obj:
-            r = _deep_scan_key_like(it, include_tokens, exclude_tokens)
-            if r is not None:
-                return r
-    return None
-
-def _parse_any_date(v: Any, year_hint: Optional[int]) -> Optional[date]:
-    d = _to_date_strict(v)
-    if d is None and isinstance(v, str):
-        d = _to_date_flex(v, year_hint)
-    return d
-
-def _extract_tx_and_value_dates(t: Dict[str, Any], year_hint: Optional[int]) -> Tuple[Optional[date], Optional[date]]:
-    """
-    FAB (and most GCC bank statements) print two separate date columns:
-      - Date (posting/booking date)  -> should be our Transaction Date
-      - Value Date                   -> should be our Value Date
-
-    DI sometimes mislabels/extracts these. We must:
-      1) Treat Posting/Booking/Date as *transaction* date candidates.
-      2) Treat only ValueDate/ValDate as *value* date candidates.
-      3) Never copy value->transaction. (Only fill value from transaction if missing.)
-    """
-
-    # 1) Prefer posting/booking/date for the transaction date (printed "Date" column)
-    txn_raw = _getv(
-        t,
-        "TransactionDate", "TxnDate", "TransDate", "TranDate",
-        "PostingDate", "PostDate", "BookingDate", "BookDate",
-        "Date",
+def _openai_json(messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    if _openai_client is None:
+        raise RuntimeError(f"OpenAI client not available: {_openai_client_error}")
+    resp = _openai_client.chat.completions.create(
+        model=OPENAI_MODEL,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=messages,
     )
-
-    # 2) Restrict value date to explicit value-date fields
-    val_raw = _getv(t, "ValueDate", "ValDate", "Value Date")
-
-    # Deep scans: steer posting/booking/date to txn; value date to val
-    if txn_raw is None:
-        txn_raw = (
-            _deep_scan_key_like(t, ("posting", "date"))
-            or _deep_scan_key_like(t, ("book", "date"))
-            or _deep_scan_key_like(t, ("date",), ("value",))  # bare "date" but NOT "value date"
-        )
-    if val_raw is None:
-        val_raw = _deep_scan_key_like(t, ("value", "date"))
-
-    txn_date = _parse_any_date(txn_raw, year_hint)
-    val_date = _parse_any_date(val_raw, year_hint)
-
-    # Last resort for transaction date: parse from description tokens using year hint
-    if txn_date is None:
-        desc = _getv(t, "Description")
-        txn_date = _date_from_tx(t, desc, year_hint)
-
-    # IMPORTANT: Only fill Value Date from Transaction Date when missing (never the other way)
-    if val_date is None and txn_date is not None:
-        val_date = txn_date
-
-    return txn_date, val_date
-
-
-# ------------------------------------------------------------------------------
-# Bank name inference (robust, UAE-focused; prioritizes specificity)
-# ------------------------------------------------------------------------------
-def _infer_bank_name_from_text(di_result: Any, filename_hint: Optional[str]) -> Tuple[Optional[str], str]:
-    # Gather text
-    first_page_text = ""
-    all_text = ""
+    txt = resp.choices[0].message.content
     try:
-        pages = getattr(di_result, "pages", []) or []
-        if pages:
-            first_page_text = "\n".join((ln.content or "") for ln in (pages[0].lines or []))
-        all_text = "\n".join((ln.content or "") for p in pages for ln in (p.lines or []))
-    except Exception:
-        pass
+        return json.loads(txt or "{}")
+    except Exception as e:
+        raise RuntimeError(f"LLM returned non-JSON: {e}: {txt[:400]}")
 
-    # Strong identifiers (BIC/SWIFT → official)
-    bic_map = {
-        "CBDUAEAD": "Commercial Bank of Dubai",
-        "ADCBAEAA": "Abu Dhabi Commercial Bank",
-        "FABUAEAD": "First Abu Dhabi Bank",
-        "NBADAEAA": "First Abu Dhabi Bank",
-        "EBILAEAD": "Emirates NBD",
-        "MSHQAEAD": "Mashreq Bank",
-        "DUIBAEAD": "Dubai Islamic Bank",
-        "RAKBAEAA": "RAKBANK",
-        "AEDIAEAD": "Emirates Islamic",
-    }
-    upper_all = all_text.upper()
-    for bic, name in bic_map.items():
-        if bic in upper_all:
-            return name, "from_bic_code"
+def _ai_map_rows(
+    tx_items: List[Dict[str, Any]],
+    statement_end_date: Optional[date],
+    bank_name: Optional[str],
+    default_currency: str,
+) -> List[Dict[str, Any]]:
+    user = _LLM_USER_TEMPLATE.format(
+        statement_end_date=statement_end_date.isoformat() if statement_end_date else None,
+        bank_name=bank_name,
+        default_currency=default_currency,
+        n=len(tx_items),
+        tx_json=json.dumps(tx_items, ensure_ascii=False, default=str),
+    )
+    out = _openai_json([
+        {"role": "system", "content": _LLM_SYSTEM},
+        {"role": "user", "content": user},
+    ])
+    rows = out.get("rows") or []
+    if not isinstance(rows, list) or len(rows) != len(tx_items):
+        raise RuntimeError("LLM output rows length mismatch")
+    return rows
 
-    # Specific phrase matches (most specific first)
-    phrase_order: List[Tuple[re.Pattern, str]] = [
-        (re.compile(r"\bCOMMERCIAL\s+BANK\s+OF\s+DUBAI\b", re.I), "Commercial Bank of Dubai"),
-        (re.compile(r"\bCBD\b(?![A-Z])", re.I), "Commercial Bank of Dubai"),
-        (re.compile(r"\bABU\s+DHABI\s+COMMERCIAL\s+BANK\b", re.I), "Abu Dhabi Commercial Bank"),
-        (re.compile(r"\bADCB\b", re.I), "Abu Dhabi Commercial Bank"),
-        (re.compile(r"\bFIRST\s+ABU\s+DHABI\b", re.I), "First Abu Dhabi Bank"),
-        (re.compile(r"\bFAB\b(?!RIC)", re.I), "First Abu Dhabi Bank"),
-        (re.compile(r"\bEMIRATES\s+NBD\b", re.I), "Emirates NBD"),
-        (re.compile(r"\bMASHREQ\b", re.I), "Mashreq Bank"),
-        (re.compile(r"\bDUBAI\s+ISLAMIC\s+BANK\b", re.I), "Dubai Islamic Bank"),
-        (re.compile(r"\bDIB\b", re.I), "Dubai Islamic Bank"),
-        (re.compile(r"\bRAK\s*BANK\b|\bRAKBANK\b", re.I), "RAKBANK"),
-        (re.compile(r"\bEMIRATES\s+ISLAMIC\b", re.I), "Emirates Islamic"),
-        (re.compile(r"\bSTANDARD\s+CHARTERED\b", re.I), "Standard Chartered"),
-        (re.compile(r"\bHSBC\b", re.I), "HSBC"),
-    ]
-
-    # Prefer first page (letterhead) first
-    for rx, name in phrase_order:
-        if rx.search(first_page_text):
-            return name, "from_first_page_text"
-
-    # Then full text
-    for rx, name in phrase_order:
-        if rx.search(all_text):
-            return name, "from_full_text"
-
-    # Finally look at filename hints
-    if filename_hint:
-        s = str(filename_hint).upper()
-        if "COMMERCIAL BANK OF DUBAI" in s or " CBD " in f" {s} " or s.startswith("CBD"):
-            return "Commercial Bank of Dubai", "from_filename"
-        if "ABU DHABI COMMERCIAL" in s or "ADCB" in s:
-            return "Abu Dhabi Commercial Bank", "from_filename"
-        if "FIRST ABU DHABI" in s or " FAB " in f" {s} " or s.startswith("FAB"):
-            return "First Abu Dhabi Bank", "from_filename"
-        if "EMIRATES NBD" in s or "ENBD" in s:
-            return "Emirates NBD", "from_filename"
-        if "MASHREQ" in s:
-            return "Mashreq Bank", "from_filename"
-        if "DUBAI ISLAMIC" in s or "DIB" in s:
-            return "Dubai Islamic Bank", "from_filename"
-        if "RAKBANK" in s or "RAK BANK" in s:
-            return "RAKBANK", "from_filename"
-        if "EMIRATES ISLAMIC" in s:
-            return "Emirates Islamic", "from_filename"
-        if "STANDARD CHARTERED" in s:
-            return "Standard Chartered", "from_filename"
-        if "HSBC" in s:
-            return "HSBC", "from_filename"
-
-    return None, "unknown"
-
-# ------------------------------------------------------------------------------
-# ROUTE: POST /tx/ingest/bank-statement
-# ------------------------------------------------------------------------------
+# ==== BANK STATEMENT INGEST ===================================================
 @router.post("/ingest/bank-statement")
 async def ingest_bank_statement(
     request: Request,
@@ -564,191 +353,169 @@ async def ingest_bank_statement(
     fields = shaped.get("fields") or {}
     accounts = shaped.get("accounts") or []
 
-    # Resolve statement year once
-    stmt_year, stmt_year_strategy = _resolve_stmt_year(shaped, accounts)
-    log.info("ingest.bank_statement.year_resolve", extra={"extra": {
-        "stmt_year": stmt_year, "strategy": stmt_year_strategy
-    }})
-
-    # Bank name with robust fallback (CBD prioritized properly)
-    bank_name = (fields.get("BankName") or {}).get("value")
-    bank_strategy = "from_model_field" if bank_name else None
-    if not bank_name:
-        bank_name, bank_strategy = _infer_bank_name_from_text(result, source)
-    log.info("ingest.bank_statement.bank_name_resolve", extra={"extra": {
-        "bank_name": bank_name, "strategy": bank_strategy
-    }})
-
-    statement_date = _to_date_strict((fields.get("StatementEndDate") or {}).get("value"))
-
-    model_tx_count = sum(len(a.get("Transactions") or []) for a in accounts)
-    log.info("ingest.bank_statement.shaped", extra={"extra": {
-        "accounts": len(accounts), "model_tx_count": model_tx_count, "stmt_year": stmt_year
-    }})
-
-    # Preview (just for logging)
-    preview: List[Dict[str, Any]] = []
-    for acc in accounts[:1]:
-        for t in (acc.get("Transactions") or [])[:5]:
-            td, vd = _extract_tx_and_value_dates(t, stmt_year)
-            preview.append({
-                "TransactionDate": td.isoformat() if td else None,
-                "ValueDate": vd.isoformat() if vd else None,
-                "Desc": _getv(t, "Description"),
-                "Deposit": _getv(t, "DepositAmount", "Credit", "PaidIn"),
-                "Withdraw": _getv(t, "WithdrawalAmount", "Debit", "PaidOut"),
-                "Amount": _getv(t, "Amount", "TransactionAmount"),
-                "Type": _getv(t, "Type", "CreditDebit", "TransactionType"),
-            })
-    if preview:
-        log.info("ingest.bank_statement.preview", extra={"extra": {"sample": preview}})
-
-    # currency (form -> inferred -> default)
+    bank_name = _infer_bank_name(fields, result, source)
+    statement_date = _infer_statement_date(fields, result, accounts)
     ccy = (currency or _infer_currency_from_result(result) or DEFAULT_CCY).upper()
 
-    # Build rows for both tables
+    total_input_rows = sum(len(a.get("Transactions") or []) for a in accounts)
+    log.info("ingest.bank_statement.shaped", extra={"extra": {
+        "accounts": len(accounts), "model_tx_count": total_input_rows,
+        "bank_name": bank_name, "statement_date": str(statement_date) if statement_date else None
+    }})
+
+    # ---- Stitch wrapped lines PER ACCOUNT & assign stable anchor line numbers
+    stitched_accounts: List[Tuple[str, List[Dict[str, Any]], int, Dict[int,int]]] = []
+    for acc in accounts:
+        acct_no = (acc.get("AccountNumber") or {}).get("value")
+        txs = acc.get("Transactions") or []
+        stitched, appended = _stitch_wrapped_lines(txs)
+
+        # assign stable anchor numbers now (1..N) after stitching
+        anchor_line_map: Dict[int,int] = {}
+        anchor_no = 0
+        for idx, _t in enumerate(stitched):
+            anchor_no += 1
+            anchor_line_map[idx] = anchor_no
+
+        stitched_accounts.append((acct_no, stitched, appended, anchor_line_map))
+        if appended:
+            log.info("ingest.bank_statement.stitch", extra={"extra": {
+                "account": acct_no, "continuations_merged": appended,
+                "original_rows": len(txs), "stitched_rows": len(stitched)
+            }})
+
+    # --- Build rows using LLM + DI fallbacks ----------------------------------
     stage_rows: List[Dict[str, Any]] = []
     reco_rows:  List[Dict[str, Any]] = []
 
-    c_missing_amt = c_missing_date = c_skipped_blank = 0
-    missing_date_samples: List[Dict[str, Any]] = []
-    backfilled_tx_total = 0
-    backfilled_val_total = 0
+    batch, batch_meta = [], []
+    def _flush_batch():
+        nonlocal batch, batch_meta, stage_rows, reco_rows
+        if not batch: return
+        ai_rows = _ai_map_rows(batch, statement_date, bank_name, ccy)
 
-    for acc in accounts:
-        acct_no = (acc.get("AccountNumber") or {}).get("value")
-        line_no = 0  # per-account line numbering
+        # rolling dates per account
+        last_tx_date: Dict[str, Optional[date]] = {}
+        last_val_date: Dict[str, Optional[date]] = {}
 
-        # rolling dates (fix continuation lines)
-        last_tx_date: Optional[date] = None
-        last_val_date: Optional[date] = None
+        for i, ai in enumerate(ai_rows):
+            acct_no = batch_meta[i]["acct_no"]
+            raw_desc = batch_meta[i]["desc"]
+            line_no = batch_meta[i]["anchor_no"]  # stable across batches
 
-        for t in (acc.get("Transactions") or []):
-            desc = _getv(t, "Description")
+            # ---- dates: LLM -> DI -> rolling backfill
+            txn_date = _as_date(ai.get("transaction_date"))
+            if txn_date is None:
+                t = batch_meta[i]["tx_obj"]
+                txn_date = _as_date(_getv(t, "TransactionDate","PostingDate","PostDate","Date","BookingDate","ValueDate"))
+            if txn_date is None:
+                txn_date = last_tx_date.get(acct_no)
 
-            # skip pure blanks
-            if not any([
-                _getv(t, "Date", "TransactionDate", "PostingDate", "PostDate", "ValueDate", "BookingDate"),
-                desc,
-                _getv(t, "Amount", "TransactionAmount", "DepositAmount", "WithdrawalAmount", "Credit", "Debit", "PaidIn", "PaidOut")
-            ]):
-                c_skipped_blank += 1
-                continue
+            val_date = _as_date(ai.get("value_date"))
+            if val_date is None:
+                t = batch_meta[i]["tx_obj"]
+                val_date = _as_date(_getv(t, "ValueDate","ValDate","Value Date"))
+            if val_date is None:
+                val_date = txn_date or last_val_date.get(acct_no)
 
-            amt = _signed_amount_from_tx(t)
+            # ---- amount: LLM -> DI fallback
+            amt = _num_soft(ai.get("statement_amount"))
             if amt is None:
-                c_missing_amt += 1
+                amt = _signed_amount_from_tx(batch_meta[i]["tx_obj"])
+
+            # if truly empty, skip (rare after stitch)
+            if amt is None and (txn_date is None and not raw_desc):
                 continue
 
-            tx_date, val_date = _extract_tx_and_value_dates(t, stmt_year)
-
-            # --- backfill dates when DI split the row and dropped the dates ---
-            if tx_date is None and last_tx_date is not None:
-                tx_date = last_tx_date
-                backfilled_tx_total += 1
-            if val_date is None and last_val_date is not None:
-                val_date = last_val_date
-                backfilled_val_total += 1
-
-            if tx_date is None:
-                c_missing_date += 1
-                if len(missing_date_samples) < 6:
-                    missing_date_samples.append({
-                        "desc": desc,
-                        "raw_date_candidates": {
-                            "Date": _getv(t, "Date"),
-                            "TransactionDate": _getv(t, "TransactionDate", "TxnDate", "TransDate", "TranDate"),
-                            "PostingDate": _getv(t, "PostingDate", "PostDate"),
-                            "ValueDate": _getv(t, "ValueDate", "ValDate", "Value Date"),
-                            "BookingDate": _getv(t, "BookingDate", "BookDate"),
-                        }
-                    })
-                continue
-
-            # stage (legacy): keep merchant_* behavior as-is
-            desc_clean = _clean_channel_prefix(desc)
-            merch_norm = _norm_merchant(desc_clean)
-
-            ref = None
-            m = _REF_RX.search(desc or "")
-            if m:
-                ref = m.group(2)
-
-            next_line_no = line_no + 1
+            desc_composed = _compose_description(ai.get("description"), ai.get("transaction_text"))
+            desc_final = desc_composed or raw_desc
+            merch_norm = _norm_merchant(desc_final)
+            ref = ai.get("reference") or ai.get("additional_transaction_info")
 
             fp = _fp([
-                acct_no,                 # account number in the statement
-                statement_date,          # statement end date (acts as the statement identity)
-                next_line_no,            # per-statement line number (stable order in PDF)
-                f"{amt:.2f}",            # keep old parts too (harmless, extra stability)
+                acct_no,
+                statement_date.isoformat() if statement_date else "",
+                line_no,
+                f"{(amt or 0):.2f}",
                 ccy,
-                merch_norm,
-                ref,
+                merch_norm or "",
+                ref or "",
             ])
 
+            # stage row
             stage_rows.append({
-                "txn_date": tx_date, "amount": amt, "currency": ccy,
-                "merchant_raw": desc, "merchant_norm": merch_norm,
-                "reference": ref, "source_file": source, "fingerprint": fp
+                "txn_date": txn_date,
+                "amount": amt,
+                "currency": ccy,
+                "merchant_raw": raw_desc,
+                "merchant_norm": merch_norm,
+                "reference": ref,
+                "source_file": batch_meta[i]["source"],
+                "fingerprint": fp,
             })
 
-            # reconciliation row
-            line_no += 1
-            check_no = None
-            if m and m.group(1).upper() in ("CHQ", "CHEQUE"):
-                check_no = m.group(2)
-
+            # reco row
             reco_rows.append({
                 "Bank Account No.": acct_no,
                 "Bank Name": bank_name,
-                "Statement Date": statement_date,          # statement-end as statement date
-                "Reconciliation date": statement_date,     # same default
+                "Statement Date": statement_date,
+                "Reconciliation date": statement_date,
                 "Statement Line No.": line_no,
-                "Document No.": None,                      # unknown at parse time
-                "Transaction Date": tx_date,
-                "Description": (desc_clean or desc),
-                "Statement Amount": amt,                   # signed amount
-                "Difference": None,                        # ERP can compute later
+                "Document No.": None,
+                "Transaction Date": txn_date,
+                "Description": desc_final,
+                "Statement Amount": amt,
+                "Difference": None,
                 "Applied Amount": None,
                 "Applied Entries": 0,
-                "Value Date": val_date or tx_date,         # always filled if tx_date exists
-                "Check No.": check_no,
-                "Related-Party Name": None,
-                "Additional Transaction Info": ref,        # store reference if any
-                "Statement Type": RECO_STATEMENT_TYPE,     # per requirement
-                "Transaction Text": (desc_clean or desc),
+                "Value Date": val_date or txn_date,
+                "Check No.": ai.get("check_no"),
+                "Related-Party Name": ai.get("related_party_name"),
+                "Additional Transaction Info": ai.get("additional_transaction_info"),
+                "Statement Type": RECO_STATEMENT_TYPE,
+                "Transaction Text": ai.get("transaction_text") or desc_final,
                 "Related-Party Bank Acc. No.": None,
                 "Related-Party Address": None,
                 "Related-Party City": None,
             })
 
-            # update rolling dates now that this row is accepted
-            if tx_date is not None:
-                last_tx_date = tx_date
-            if val_date is not None:
-                last_val_date = val_date
+            last_tx_date[acct_no] = txn_date or last_tx_date.get(acct_no)
+            last_val_date[acct_no] = (val_date or txn_date) or last_val_date.get(acct_no)
+
+        batch, batch_meta = [], []
+
+    # accumulate batches (preserving order) from stitched txs
+    for acct_no, stitched_txs, _appended, anchor_map in stitched_accounts:
+        for idx, t in enumerate(stitched_txs or []):
+            tx_desc = _getv(t, "Description")
+            batch.append(t)
+            batch_meta.append({
+                "acct_no": acct_no,
+                "desc": tx_desc,
+                "source": (file.filename if file else url),
+                "tx_obj": t,
+                "anchor_no": anchor_map[idx],
+            })
+            if len(batch) >= AI_TX_BATCH_SIZE:
+                _flush_batch()
+    _flush_batch()
 
     log.info("ingest.bank_statement.rows_built", extra={"extra": {
         "rows": len(stage_rows),
         "reco_rows": len(reco_rows),
-        "skipped_missing_amount": c_missing_amt,
-        "skipped_missing_date": c_missing_date,
-        "skipped_pure_blank": c_skipped_blank,
-        "missing_date_samples": missing_date_samples,
-        "backfilled_tx_date": backfilled_tx_total,
-        "backfilled_val_date": backfilled_val_total,
+        "bank_name": bank_name,
+        "statement_date": str(statement_date) if statement_date else None
     }})
 
     if not stage_rows:
         log.warning("ingest.bank_statement.no_rows_detected")
         return {"status": "no_rows_detected", "inserted": 0, "reco_inserted": 0, "total": 0}
 
-    # Insert both sets
+    # --- Insert both sets -----------------------------------------------------
     inserted = 0
     reco_inserted = 0
     with log_duration("ingest.bank_statement.insert", rows=len(stage_rows)):
         async with db_conn() as conn:
-            # transactions_staging
             for r in stage_rows:
                 ok = await conn.fetchval(
                     """
@@ -765,7 +532,6 @@ async def ingest_bank_statement(
                 if ok == 1:
                     inserted += 1
 
-            # bank_reconciliation_staging
             for rr in reco_rows:
                 ok2 = await conn.fetchval(
                     """
@@ -799,9 +565,27 @@ async def ingest_bank_statement(
     }})
     return {"status": "ok", "inserted": inserted, "reco_inserted": reco_inserted, "total": len(stage_rows)}
 
-# ------------------------------------------------------------------------------
-# ROUTE: POST /tx/ingest/receipt
-# ------------------------------------------------------------------------------
+# ==== RECEIPT INGEST (LLM-normalized, minimal) ===============================
+_LLM_RECEIPT_SYSTEM = """You normalize receipt fields into strict JSON.
+- date -> 'YYYY-MM-DD' or null
+- total -> number or null
+- currency -> 3-letter code if present else null
+- merchant -> cleaned merchant name (short) or null
+Return: {"date": "...", "total": 0.0, "currency": "...", "merchant": "..."}"""
+
+def _ai_norm_receipt(obj: Dict[str, Any], default_currency: str) -> Dict[str, Any]:
+    user = f"Default Currency: {default_currency}\nRaw fields JSON:\n{json.dumps(obj, ensure_ascii=False, default=str)}"
+    out = _openai_json([
+        {"role": "system", "content": _LLM_RECEIPT_SYSTEM},
+        {"role": "user", "content": user},
+    ])
+    return {
+        "date": out.get("date"),
+        "total": out.get("total"),
+        "currency": out.get("currency") or default_currency,
+        "merchant": out.get("merchant"),
+    }
+
 @router.post("/ingest/receipt")
 async def ingest_receipt(
     request: Request,
@@ -839,34 +623,21 @@ async def ingest_receipt(
                 raise HTTPException(status_code=400, detail="Provide 'file' or 'url'.")
         except Exception as e:
             log.exception("ingest.receipt.di_error")
-            raise HTTPException(status_code=502, detail=f"Document Intelligence error: {e}")
+            raise HTTPException(status_code=502, detail="Document Intelligence error: {e}")
 
     shaped = di_receipt.receipt_to_dict(result)
     f = shaped.get("fields", {}) or {}
 
-    raw_date  = (f.get("TransactionDate") or {}).get("value")
-    raw_total = (f.get("Total")            or {}).get("value")
-    currency  = (f.get("Currency")         or {}).get("value") or DEFAULT_CCY
-    merchant  = (f.get("MerchantName")     or {}).get("value")
+    ai = _ai_norm_receipt(f, DEFAULT_CCY)
+    receipt_date = _as_date(ai.get("date"))
+    total = _num_soft(ai.get("total"))
+    currency = (ai.get("currency") or DEFAULT_CCY).upper()
+    merchant = ai.get("merchant")
     merch_norm = _norm_merchant(merchant)
-
-    log.info("ingest.receipt.shaped", extra={"extra": {
-        "has_date": raw_date is not None, "has_total": raw_total is not None,
-        "has_currency": currency is not None, "has_merchant": merchant is not None
-    }})
-
-    def _to_date_any(v: Any):
-        d = _to_date_strict(v)
-        if d is None and isinstance(v, str):
-            d = _to_date_flex(v, None)
-        return d
-
-    receipt_date = _to_date_any(raw_date)
-    total        = _to_num(raw_total)
 
     if receipt_date is None or total is None:
         log.warning("ingest.receipt.missing_core_fields", extra={"extra": {
-            "date_raw": raw_date, "total_raw": raw_total
+            "date_raw": ai.get("date"), "total_raw": ai.get("total")
         }})
         raise HTTPException(status_code=422, detail="Could not parse receipt date/total.")
 

@@ -7,3 +7,5 @@ azure-ai-documentintelligence==1.0.2
 sqlalchemy==2.0.44
 uvicorn==0.38.0
 python-dotenv==1.1.1
+httpx==0.28.1
+openai==2.6.0
