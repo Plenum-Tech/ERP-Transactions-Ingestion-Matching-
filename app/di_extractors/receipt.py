@@ -248,6 +248,168 @@ def _fallback_total_from_lines(result) -> Tuple[Optional[float], Optional[str]]:
     _log.debug("di.receipt.lines.no_total")
     return None, None
 
+# ----------------------------- items (table) fallback -----------------------------
+_ITEM_HEADER_SYNONYMS = {
+    "desc": {
+        "description", "item", "item description", "item name", "product",
+        "details", "particulars", "service", "menu item", "article"
+    },
+    "qty": {
+        "qty", "quantity", "qnty", "pcs", "pieces", "units", "unit(s)", "no", "nos"
+    },
+    "price": {
+        "price", "unit price", "rate", "each", "unit cost", "price/qty",
+        "unit", "u/price", "u price", "per unit"
+    },
+    "total": {
+        "amount", "total", "line total", "ext price", "subtotal", "net", "sum"
+    },
+}
+
+def _norm_header_token(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9 ]+", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _header_score_and_map(row: List[str]) -> Tuple[int, Dict[str, int]]:
+    """
+    Return (score, mapping) where mapping is like {"desc": 0, "qty": 1, "price": 2, "total": 3}
+    Score = number of roles found (0..4). We require >=2 to consider it a header row.
+    """
+    mapping: Dict[str, int] = {}
+    tokens = [_norm_header_token(c) for c in row]
+    for idx, tok in enumerate(tokens):
+        if not tok:
+            continue
+        # exact token match against any synonym set
+        for role, syns in _ITEM_HEADER_SYNONYMS.items():
+            if role in mapping:
+                continue
+            if tok in syns:
+                mapping[role] = idx
+                continue
+        # relaxed contains match (e.g., "item/description", "qty.")
+        if "desc" not in mapping and re.search(r"\b(desc|description|item)\b", tok):
+            mapping["desc"] = idx
+        if "qty" not in mapping and re.search(r"\b(qty|quantity|pcs|units?)\b", tok):
+            mapping["qty"] = idx
+        if "price" not in mapping and re.search(r"\b(price|rate|unit( price| cost)?)\b", tok):
+            mapping["price"] = idx
+        if "total" not in mapping and re.search(r"\b(total|amount|line total|subtotal|net)\b", tok):
+            mapping["total"] = idx
+
+    score = len(mapping)
+    return score, mapping
+
+def _detect_items_header(grid: List[List[str]]) -> Tuple[Optional[int], Dict[str, int]]:
+    """
+    Scan first ~8 rows to find the most "header-like" row and return (row_index, mapping).
+    """
+    best = (0, {})  # (score, mapping)
+    best_idx: Optional[int] = None
+    scan_limit = min(len(grid), 8)
+    for i in range(scan_limit):
+        score, mapping = _header_score_and_map(grid[i])
+        # we want at least 2 roles to accept as a header
+        if score >= 2 and score > best[0]:
+            best = (score, mapping)
+            best_idx = i
+    return best_idx, (best[1] if best_idx is not None else {})
+
+def _parse_qty(text: str) -> Optional[float]:
+    # also handle patterns like "2 x 12.00"
+    if not text:
+        return None
+    m_combo = re.search(r"^\s*(\d+(?:\.\d+)?)\s*x\s*[\d.,]+", text, re.I)
+    if m_combo:
+        try:
+            return float(m_combo.group(1))
+        except Exception:
+            pass
+    return _extract_number(text)
+
+def _parse_item_row(row: List[str], mapping: Dict[str, int], default_ccy: Optional[str]) -> Optional[Dict[str, Any]]:
+    def at(role: str) -> str:
+        idx = mapping.get(role)
+        return (row[idx] if (idx is not None and 0 <= idx < len(row)) else "").strip()
+
+    desc = at("desc")
+    qty_txt = at("qty")
+    price_txt = at("price")
+    total_txt = at("total")
+
+    qty = _parse_qty(qty_txt)
+    price, _c1 = _parse_amount_with_currency(price_txt)
+    total, _c2 = _parse_amount_with_currency(total_txt)
+
+    # compute total if possible
+    if total is None and qty is not None and price is not None:
+        try:
+            total = round(qty * price, 2)
+        except Exception:
+            pass
+
+    # skip empty rows
+    if not desc and qty is None and price is None and total is None:
+        return None
+
+    item = {
+        "Description": {"value": desc or None, "confidence": None},
+        "Quantity":    {"value": qty, "confidence": None},
+        "Price":       {"value": price, "confidence": None},
+        "TotalPrice":  {"value": total, "confidence": None},
+        "ProductCode": {"value": None, "confidence": None},
+        "Date":        {"value": None, "confidence": None},
+        "Category":    {"value": None, "confidence": None},
+    }
+    # Optionally store per-line currency (commented):
+    # item["LineCurrency"] = {"value": _c2 or _c1 or default_ccy, "confidence": None}
+    return item
+
+def _merge_continuation_descriptions(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    If a row only has Description (no qty/price/total), append it to the previous item's description.
+    """
+    merged: List[Dict[str, Any]] = []
+    for it in items:
+        has_numbers = any(it[k]["value"] is not None for k in ("Quantity", "Price", "TotalPrice"))
+        desc = (it.get("Description") or {}).get("value")
+        if desc and not has_numbers and merged:
+            prev = merged[-1]
+            prev_desc = (prev["Description"]["value"] or "").rstrip()
+            prev["Description"]["value"] = (prev_desc + " " + desc).strip()
+        else:
+            merged.append(it)
+    return merged
+
+def _fallback_items_from_tables(result, default_currency: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Walk all tables, try to find an items table, and parse rows under the detected header.
+    """
+    extracted: List[Dict[str, Any]] = []
+    for tbl in _tables(result):
+        grid = _grid_from_table(tbl)
+        if not grid or not any(any(c.strip() for c in row) for row in grid):
+            continue
+        header_idx, mapping = _detect_items_header(grid)
+        if header_idx is None or not mapping:
+            continue
+
+        # parse all body rows after header
+        for r in range(header_idx + 1, len(grid)):
+            row = grid[r]
+            item = _parse_item_row(row, mapping, default_currency)
+            if item:
+                extracted.append(item)
+
+    if extracted:
+        extracted = _merge_continuation_descriptions(extracted)
+        _log.info("di.receipt.table.items_found", extra={"extra": {"count": len(extracted)}})
+    else:
+        _log.debug("di.receipt.table.no_items")
+    return extracted
+
 # ----------------------------- shaping -----------------------------
 _HEADER_FIELDS: List[str] = [
     "MerchantName",
@@ -290,6 +452,13 @@ def receipt_to_dict(result) -> Dict[str, Any]:
     for it in _get_array(items):
         props = _get_props(it)
         out["items"].append({k: _kv(props.get(k)) for k in _ITEM_FIELDS})
+
+    # 2b) fallback items from tables when model didn't return them
+    if not out["items"]:
+        header_ccy = (out["fields"].get("Currency") or {}).get("value")
+        out["items"] = _fallback_items_from_tables(result, header_ccy)
+        if out["items"]:
+            _log.info("di.receipt.fallback.items_applied", extra={"extra": {"items": len(out["items"])}})
 
     # quick presence log
     def _getv(key: str):
@@ -347,4 +516,3 @@ def receipt_to_dict(result) -> Dict[str, Any]:
         "items": len(out["items"])
     }})
     return out
-
