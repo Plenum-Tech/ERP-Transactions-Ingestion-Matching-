@@ -1,6 +1,6 @@
 # app/models.py
 from sqlalchemy import (
-    MetaData, Table, Column, String, Date, Time, Numeric, DateTime, text, UniqueConstraint, Index
+    MetaData, Table, Column, String, Date, Time, Numeric, DateTime, text, UniqueConstraint, Index , ForeignKey
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 import uuid
@@ -111,5 +111,34 @@ receipts_staging = Table(
     UniqueConstraint("fingerprint", name="uq_receipts_staging_fingerprint"),
     Index("ix_rcpt_stage_date", "receipt_date"),
     Index("ix_rcpt_stage_merchant", "merchant_norm"),
+    schema="erp_ai",
+)
+
+
+receipt_items_staging = Table(
+    "receipt_items_staging",
+    metadata,
+    uuid_pk(),
+    Column("receipt_id", UUID(as_uuid=True), ForeignKey("erp_ai.receipts_staging.id", ondelete="SET NULL"), nullable=True),
+    Column("receipt_fingerprint", String(64), nullable=False),
+
+    Column("line_no",  Numeric(10,0), nullable=False),
+    Column("description", String),
+    Column("quantity", Numeric(18,4)),
+    Column("unit_price", Numeric(18,4)),
+    Column("line_total", Numeric(18,4)),
+    Column("product_code", String),
+    Column("line_date", Date),
+    Column("category", String),
+    Column("currency", String(8)),
+    Column("source_file", String),
+
+    Column("item_fingerprint", String(64), nullable=False),
+    Column("created_at", DateTime(timezone=True), server_default=text("now()")),
+
+    UniqueConstraint("item_fingerprint", name="uq_receipt_items_item_fp"),
+    Index("ix_rcpt_items_receipt_fp", "receipt_fingerprint"),
+    Index("ix_rcpt_items_line_no", "line_no"),
+    Index("ix_rcpt_items_product", "product_code"),
     schema="erp_ai",
 )
