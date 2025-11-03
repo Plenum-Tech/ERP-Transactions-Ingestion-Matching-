@@ -3,6 +3,8 @@ from fastapi import FastAPI
 from starlette.staticfiles import StaticFiles
 from app.db import init_pool, close_pool
 from app.routers import tx_ingest
+from app.routers import match_preview  # keep your name
+
 from app.utils.logger import RequestContextLogMiddleware, get_logger
 import os
 
@@ -32,3 +34,5 @@ async def healthz():
 
 # Ingestion routes (bank statements + receipts + upload)
 app.include_router(tx_ingest.router)
+
+app.include_router(match_preview.router)
